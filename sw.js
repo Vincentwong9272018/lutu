@@ -1,4 +1,4 @@
-const CACHE = "lutu-v1";
+const CACHE = "lutu-v7";
 const PRECACHE = [
   "./",
   "./index.html",

@@ -42,6 +42,9 @@
     refresh: '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.5 9a9 9 0 0 1 14.8-3.3L23 10M1 14l4.7 4.3A9 9 0 0 0 20.5 15"/>',
     list: '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/>',
     utensils: '<path d="M3 2v7c0 1.1.9 2 2 2h4a2 2 0 0 0 2-2V2"/><path d="M7 2v20"/><path d="M21 15V2v0a5 5 0 0 0-5 5v6c0 1.1.9 2 2 2h3zm0 0v7"/>',
+    camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+    star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
+    share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.6" y1="13.5" x2="15.4" y2="17.5"/><line x1="15.4" y1="6.5" x2="8.6" y2="10.5"/>',
   };
 
   function icon(name, size = 18) {
@@ -67,7 +70,9 @@
     view: "home",
     tripId: null,
     tab: "overview",
-    sub: { lists: "packing", money: "spend", guide: "info" },
+    sub: { lists: "packing", money: "spend", guide: "info", journalDay: null, journalView: "day" },
+    homeQuery: "",
+    spotQuery: "",
     filter: "all",
     busy: null,
     rates: null,
@@ -95,6 +100,333 @@
     else state.trips.unshift(t);
     persist();
     if (rerender) render();
+  }
+
+  const photoURLs = {};
+  let photoCtx = null;
+  let searchTimer = 0;
+  function searchField(id, placeholder, value) {
+    return `<div class="search-wrap">
+      <input id="${id}" type="text" lang="zh-Hant" inputmode="text" enterkeyhint="search" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="${esc(
+        placeholder
+      )}" value="${esc(value || "")}">
+    </div>`;
+  }
+  function isSearchBox(el) {
+    return el && (el.id === "home-q" || el.id === "spot-q");
+  }
+  function homeResultsHtml(q) {
+    const query = String(q || "").trim();
+    if (!query) return "";
+    const hits = state.trips.flatMap((tr) => spotsList(tr, query).map(({ it, idx }) => ({ tr, it, idx })));
+    if (!hits.length) return `<div class="card empty"><p>搵唔到「${esc(query)}」嘅回憶。</p></div>`;
+    return hits.map(({ tr, it, idx }) => spotCard(tr, it, idx, { showTrip: true })).join("");
+  }
+  function paintSearchResults(from) {
+    if (from === "home-q" || from === "home") {
+      const box = $("#home-results");
+      if (!box) return;
+      const html = homeResultsHtml(state.homeQuery);
+      box.innerHTML = html;
+      box.hidden = !html;
+      hydratePhotos();
+      return;
+    }
+    const t = trip();
+    const box = $("#spot-results");
+    if (!t || !box) return;
+    const list = spotsList(t, state.spotQuery);
+    box.innerHTML = list.map(({ it, idx }) => spotCard(t, it, idx)).join("") || spotsEmpty(state.spotQuery);
+    hydratePhotos();
+  }
+  function applySearchBox(el) {
+    if (!isSearchBox(el)) return;
+    if (el.id === "home-q") state.homeQuery = el.value;
+    else state.spotQuery = el.value;
+    paintSearchResults(el.id);
+  }
+  function openMediaDB() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open("lutu-media", 1);
+      req.onupgradeneeded = () => {
+        if (!req.result.objectStoreNames.contains("photos")) req.result.createObjectStore("photos");
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function putPhoto(id, blob) {
+    const db = await openMediaDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("photos", "readwrite");
+      tx.objectStore("photos").put(blob, id);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  async function getPhoto(id) {
+    const db = await openMediaDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("photos", "readonly");
+      const req = tx.objectStore("photos").get(id);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function removePhoto(id) {
+    if (photoURLs[id]) {
+      URL.revokeObjectURL(photoURLs[id]);
+      delete photoURLs[id];
+    }
+    const db = await openMediaDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("photos", "readwrite");
+      tx.objectStore("photos").delete(id);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+  async function photoSrc(id) {
+    if (photoURLs[id]) return photoURLs[id];
+    const blob = await getPhoto(id);
+    if (!blob) return "";
+    photoURLs[id] = URL.createObjectURL(blob);
+    return photoURLs[id];
+  }
+  async function hydratePhotos() {
+    const imgs = $$("[data-photo]");
+    for (const img of imgs) {
+      const src = await photoSrc(img.dataset.photo);
+      if (src) img.src = src;
+    }
+  }
+  function compressImage(file, max = 1600, quality = 0.72) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        let w = img.width;
+        let h = img.height;
+        if (Math.max(w, h) > max) {
+          const s = max / Math.max(w, h);
+          w = Math.round(w * s);
+          h = Math.round(h * s);
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(url);
+            blob ? resolve(blob) : reject(new Error("壓縮失敗"));
+          },
+          "image/jpeg",
+          quality
+        );
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("相片無法讀取"));
+      };
+      img.src = url;
+    });
+  }
+  function mapsSearch(loc) {
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(loc)}`;
+  }
+  function mapsTransit(from, to) {
+    return `https://www.google.com/maps/dir/?api=1&origin=${encodeURIComponent(from)}&destination=${encodeURIComponent(to)}&travelmode=transit`;
+  }
+  function itemsForDay(t, day) {
+    return (t.itinerary || [])
+      .filter((i) => String(i.day) === String(day))
+      .sort((a, b) => String(a.time).localeCompare(String(b.time)));
+  }
+  function timeToMin(s) {
+    const [h, m] = String(s || "00:00").split(":").map(Number);
+    return (h || 0) * 60 + (m || 0);
+  }
+  function todayFocus(t) {
+    const st = tripStatus(t);
+    const day = st === "now" ? currentDayIndex(t) : 1;
+    const items = itemsForDay(t, day);
+    let current = null;
+    let next = null;
+    if (st === "now") {
+      const mins = new Date().getHours() * 60 + new Date().getMinutes();
+      for (const it of items) {
+        if (timeToMin(it.time) <= mins) current = it;
+        else {
+          next = it;
+          break;
+        }
+      }
+    } else {
+      next = items[0] || null;
+    }
+    const nextIdx = next ? items.indexOf(next) : -1;
+    const rest = nextIdx >= 0 ? items.slice(nextIdx) : st === "now" && current && !next ? [] : items.slice(0, 4);
+    return { st, day, items, current, next, rest };
+  }
+  function todayShareText(t) {
+    const focus = todayFocus(t);
+    const day = focus.st === "past" ? tripDays(t) : focus.day;
+    const date = dateOfDay(t, day);
+    const items = itemsForDay(t, day);
+    const lines = [`${t.destination} · 第 ${day} 日（${niceDate(date)}）`, ""];
+    if (!items.length) lines.push("今日未有行程項目。");
+    items.forEach((it) => {
+      lines.push(`${it.time}  ${it.content}`);
+      if (it.location) lines.push(`地圖：${mapsSearch(it.location)}`);
+      lines.push("");
+    });
+    lines.push("— 由 Lutu 旅途分享");
+    return lines.join("\n");
+  }
+  function photoGrid(ids, ctx) {
+    const list = ids || [];
+    return `<div class="photo-grid">
+      ${list
+        .map(
+          (id) => `<div class="photo-cell">
+            <img data-photo="${esc(id)}" alt="" data-act="view-photo" data-id="${esc(id)}">
+            <button type="button" class="photo-x" data-act="del-photo" data-id="${esc(id)}" data-kind="${esc(ctx.kind)}" data-parent="${esc(
+            ctx.parent || ""
+          )}">${icon("x", 12)}</button>
+          </div>`
+        )
+        .join("")}
+      <button type="button" class="photo-add" data-act="pick-photo" data-kind="${esc(ctx.kind)}" data-parent="${esc(ctx.parent || "")}" data-day="${esc(
+      ctx.day || ""
+    )}">${icon("camera", 22)}<span>加相片</span></button>
+    </div>`;
+  }
+  function starsHtml(rating, dataAttrs) {
+    return `<div class="stars" role="group" aria-label="體驗評分">${[1, 2, 3, 4, 5]
+      .map(
+        (n) =>
+          `<button type="button" class="${n <= (rating || 0) ? "on" : ""}" ${dataAttrs} data-n="${n}">${icon("star", 22)}</button>`
+      )
+      .join("")}</div>`;
+  }
+  function hasMem(it) {
+    return !!(it && (it.memory || it.rating || (it.photoIds || []).length));
+  }
+  function memStars(n) {
+    n = Number(n) || 0;
+    return n ? "★".repeat(n) + "☆".repeat(5 - n) : "";
+  }
+  async function clearItemMemory(it) {
+    if (!it) return;
+    for (const id of it.photoIds || []) {
+      try {
+        await removePhoto(id);
+      } catch {}
+    }
+    it.memory = "";
+    it.rating = 0;
+    it.photoIds = [];
+  }
+  function openMemory(idx) {
+    const t = trip();
+    const it = t?.itinerary?.[idx];
+    if (!it) return;
+    it.photoIds = it.photoIds || [];
+    const date = dateOfDay(t, it.day);
+    openModal(`
+      <p class="kicker" style="color:var(--muted)">第 ${esc(it.day)} 日 · ${esc(it.time)} · ${niceDate(date)}</p>
+      <h3>${esc(it.content)}</h3>
+      ${it.location ? `<p class="help">${esc(it.location)}</p>` : ""}
+      <div class="help" style="margin-top:8px">體驗評分</div>
+      ${starsHtml(it.rating, `data-act="rate-item" data-idx="${idx}"`)}
+      <form class="form" data-submit="save-memory" style="margin-top:12px">
+        <input type="hidden" name="idx" value="${idx}">
+        <div class="field"><label>呢個景點記低</label>
+          <textarea name="memory" placeholder="排隊幾耐、好唔好食、值唔值得返、小貼士…">${esc(it.memory || "")}</textarea>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost" data-act="close-modal">取消</button>
+          <button type="submit" class="btn btn-primary">儲存回憶</button>
+        </div>
+      </form>
+      <div class="help" style="margin-top:8px">相片</div>
+      ${photoGrid(it.photoIds, { kind: "item", parent: it.id })}
+      ${
+        hasMem(it)
+          ? `<button type="button" class="btn btn-danger btn-block" style="margin-top:14px" data-act="del-memory" data-idx="${idx}">${icon(
+              "trash",
+              14
+            )} 刪除評論</button>`
+          : ""
+      }`);
+    hydratePhotos();
+  }
+  function spotsList(t, q) {
+    const query = String(q || "").trim().toLowerCase();
+    return (t.itinerary || [])
+      .map((it, idx) => ({ it, idx }))
+      .filter(({ it }) => {
+        if (!hasMem(it)) return false;
+        if (!query) return true;
+        return [it.content, it.location, it.memory, it.type].join(" ").toLowerCase().includes(query);
+      })
+      .sort((a, b) => Number(a.it.day) - Number(b.it.day) || String(a.it.time).localeCompare(String(b.it.time)));
+  }
+  function spotsEmpty(q) {
+    return `<div class="card empty"><p>${
+      String(q || "").trim() ? "搵唔到呢個回憶。" : "未有景點評論。去行程撳「記低」先寫。"
+    }</p></div>`;
+  }
+  function spotCard(t, it, idx, { showTrip } = {}) {
+    const thumbs = (it.photoIds || []).slice(0, 3);
+    return `<article class="card card-pad mem-card" data-act="open-memory" data-trip="${esc(t.id)}" data-idx="${idx}">
+      <div class="mem-card-top">
+        <div>
+          <div class="help">${showTrip ? esc(t.destination) + " · " : ""}第 ${esc(it.day)} 日 · ${esc(it.time)}${
+      it.type ? " · " + esc(it.type) : ""
+    }</div>
+          <h4>${esc(it.content)}</h4>
+        </div>
+        ${
+          hasMem(it)
+            ? `<button type="button" class="icon-btn danger" title="刪除評論" data-act="del-memory" data-trip="${esc(
+                t.id
+              )}" data-idx="${idx}">${icon("trash", 16)}</button>`
+            : ""
+        }
+      </div>
+      ${it.location ? `<div class="help">${esc(it.location)}</div>` : ""}
+      ${it.rating ? `<div class="mem-stars">${memStars(it.rating)}</div>` : ""}
+      ${
+        it.memory
+          ? `<p class="mem-snip">${esc(it.memory)}</p>`
+          : hasMem(it)
+            ? ""
+            : `<p class="help">未有記低 · 撳入去寫</p>`
+      }
+      ${
+        thumbs.length
+          ? `<div class="mem-thumbs">${thumbs.map((id) => `<img data-photo="${esc(id)}" alt="">`).join("")}</div>`
+          : ""
+      }
+    </article>`;
+  }
+  function journalOf(t, day, create) {
+    t.journal = t.journal || [];
+    let j = t.journal.find((x) => String(x.day) === String(day));
+    if (!j && create) {
+      j = { id: uid(), day: String(day), text: "", rating: 0, photoIds: [] };
+      t.journal.push(j);
+    }
+    return j;
+  }
+  function tripPhotoIds(t) {
+    const ids = [];
+    (t.tickets || []).forEach((tk) => (tk.photoIds || []).forEach((id) => ids.push(id)));
+    (t.journal || []).forEach((j) => (j.photoIds || []).forEach((id) => ids.push(id)));
+    (t.itinerary || []).forEach((it) => (it.photoIds || []).forEach((id) => ids.push(id)));
+    return ids;
   }
 
   function parseLocal(date, time = "00:00") {
@@ -467,6 +799,9 @@ HH:MM|類型|項目名稱|GoogleMap地點
           location,
           url: p[4] || "",
           notes: "",
+          memory: "",
+          rating: 0,
+          photoIds: [],
         });
       }
     }
@@ -606,6 +941,11 @@ HH:MM|類型|項目名稱|GoogleMap地點
             <div class="hero-meta">
               <span class="chip">${icon("cal", 12)} ${esc(next.startDate)} → ${esc(next.endDate)}</span>
               ${next.country ? `<span class="chip">${esc(next.country)}</span>` : ""}
+              ${
+                tripStatus(next) === "now" && todayFocus(next).next
+                  ? `<span class="chip">${esc(todayFocus(next).next.time)} ${esc(String(todayFocus(next).next.content).slice(0, 16))}</span>`
+                  : ""
+              }
             </div>
           </div>
         </article>`
@@ -620,7 +960,7 @@ HH:MM|類型|項目名稱|GoogleMap地點
       ["all", "全部"],
       ["upcoming", "即將出發"],
       ["now", "進行中"],
-      ["past", "回憶"],
+      ["past", "已結束"],
     ]
       .map(
         ([id, l]) =>
@@ -641,9 +981,9 @@ HH:MM|類型|項目名稱|GoogleMap地點
             <div class="progress" title="行李 ${pct}%"><i style="width:${pct}%"></i></div>
             <div style="margin-top:8px"><span class="chip chip-ink">${label}</span></div>
           </div>
-          <div class="trip-actions" onclick="event.stopPropagation()">
-            <button class="icon-btn" title="匯出" data-act="export-trip" data-id="${t.id}">${icon("down", 16)}</button>
-            <button class="icon-btn danger" title="刪除" data-act="delete-trip" data-id="${t.id}">${icon("trash", 16)}</button>
+          <div class="trip-actions">
+            <button type="button" class="icon-btn" title="匯出" data-act="export-trip" data-id="${t.id}">${icon("down", 16)}</button>
+            <button type="button" class="icon-btn danger" title="刪除" data-act="delete-trip" data-id="${t.id}">${icon("trash", 16)}</button>
           </div>
         </article>`;
       })
@@ -664,6 +1004,10 @@ HH:MM|類型|項目名稱|GoogleMap地點
         </div>
       </header>
       ${hero}
+      ${searchField("home-q", "搵已有評論嘅景點回憶…", state.homeQuery)}
+      <div id="home-results" class="mem-list" style="margin-bottom:16px" ${
+        (state.homeQuery || "").trim() ? "" : "hidden"
+      }>${homeResultsHtml(state.homeQuery)}</div>
       <div class="section-head">
         <h3>我的旅程</h3>
         <div style="display:flex;gap:8px">
@@ -688,6 +1032,7 @@ HH:MM|類型|項目名稱|GoogleMap地點
       ["lists", "清單", "list"],
       ["money", "花費", "wallet"],
       ["stay", "出行", "bed"],
+      ["journal", "日誌", "edit"],
       ["guide", "指南", "book"],
     ];
     return `<nav class="tabs">${tabs
@@ -712,6 +1057,7 @@ HH:MM|類型|項目名稱|GoogleMap地點
       lists: tabLists,
       money: tabMoney,
       stay: tabStay,
+      journal: tabJournal,
       guide: tabGuide,
     }[state.tab](t);
 
@@ -752,17 +1098,63 @@ HH:MM|類型|項目名稱|GoogleMap地點
       0
     );
     const budget = Number(t.budget?.amount) || 0;
-    const nextItems = (t.itinerary || [])
-      .filter((i) => Number(i.day) === (tripStatus(t) === "now" ? currentDayIndex(t) : 1))
-      .sort((a, b) => a.time.localeCompare(b.time))
-      .slice(0, 3);
+    const focus = todayFocus(t);
     const weather = (t.weather || [])
       .map(
         (w) => `<div class="wday"><div class="d">${esc(w.date)}</div><div class="ico">${w.icon}</div><div class="t">${w.min}°～${w.max}°</div></div>`
       )
       .join("");
+    const headline =
+      focus.st === "now" ? (focus.next ? "下一站" : focus.current ? "今日行程已經行完" : "今日未有行程") : focus.st === "upcoming" ? "出發日第一站" : "旅程回顧";
+    const main = focus.next || (focus.st === "now" ? focus.current : focus.items[0]);
+    const prevLoc = focus.current && focus.next && focus.current.location && focus.next.location ? focus.current.location : "";
+    const rest = (focus.rest || []).filter((x) => x !== main).slice(0, 4);
+    const j = journalOf(t, focus.day, false);
 
     return `
+      <section class="card now-card">
+        <p class="kicker">${focus.st === "now" ? "而家" : focus.st === "upcoming" ? "即將出發" : "回憶"} · 第 ${focus.day} 日</p>
+        <div class="help">${headline}</div>
+        ${
+          main
+            ? `<h3><span class="time">${esc(main.time)}</span> ${esc(main.content)}</h3>
+            <div class="meta" style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 12px">
+              ${main.type ? `<span class="pill">${esc(main.type)}</span>` : ""}
+              ${
+                main.location
+                  ? `<a class="pill map" target="_blank" rel="noopener" href="${mapsSearch(main.location)}">${icon("pin", 12)} ${esc(
+                      main.location
+                    )}</a>`
+                  : ""
+              }
+              ${
+                prevLoc
+                  ? `<a class="pill train" target="_blank" rel="noopener" href="${mapsTransit(prevLoc, main.location)}">${icon(
+                      "train",
+                      12
+                    )} 去下一站</a>`
+                  : ""
+              }
+            </div>`
+            : `<p class="help">未有行程。可用 AI 一鍵規劃。</p>`
+        }
+        ${rest
+          .map(
+            (i) => `<div class="preview-row">
+              <span class="time">${esc(i.time)}</span>
+              <div class="txt"><p>${esc(i.content)}</p></div>
+            </div>`
+          )
+          .join("")}
+        <div class="toolbar" style="margin:12px 0 0">
+          <button class="btn btn-primary btn-sm" data-act="share-today">${icon("share", 14)} 分享今日</button>
+          <button class="btn btn-soft btn-sm" data-act="share-qr">${icon("link", 14)} QR</button>
+          <button class="btn btn-soft btn-sm" data-act="tab" data-id="itinerary">睇全部</button>
+          <button class="btn btn-gold btn-sm" data-act="tab" data-id="journal">${icon("edit", 14)} ${
+      j?.text || j?.rating ? "睇日誌" : "寫今日"
+    }</button>
+        </div>
+      </section>
       <div class="stat-grid">
         <div class="stat"><b>${days}</b><span>日行程</span></div>
         <div class="stat"><b>${packingProgress(t)}%</b><span>行李進度</span></div>
@@ -777,25 +1169,6 @@ HH:MM|類型|項目名稱|GoogleMap地點
         <div class="section-head" style="margin:0 0 10px"><h3 style="font-size:1rem">天氣</h3>
           <button class="btn btn-soft btn-sm" data-act="weather">${icon("refresh", 14)} 更新</button></div>
         <div class="weather-row">${weather || `<p class="help">未有預報。撳更新獲取 7 日天氣。</p>`}</div>
-      </div>
-      <div class="card card-pad" style="margin-bottom:12px">
-        <div class="section-head" style="margin:0 0 10px"><h3 style="font-size:1rem">${
-          tripStatus(t) === "now" ? "今日行程" : "第一日預覽"
-        }</h3>
-          <button class="btn btn-soft btn-sm" data-act="tab" data-id="itinerary">睇全部</button></div>
-        ${
-          nextItems
-            .map(
-              (i) => `<div class="preview-row">
-                <span class="time">${esc(i.time)}</span>
-                <div class="txt">
-                  ${i.type ? `<span class="pill">${esc(i.type)}</span>` : ""}
-                  <p>${esc(i.content)}</p>
-                </div>
-              </div>`
-            )
-            .join("") || `<p class="help">未有行程。可用 AI 一鍵規劃。</p>`
-        }
       </div>
       <div class="toolbar">
         <button class="btn btn-accent" data-act="ai-all">${icon("spark")} AI 一鍵規劃</button>
@@ -879,7 +1252,16 @@ HH:MM|類型|項目名稱|GoogleMap地點
                 }
                 ${transit}${gift}${web}
                 <button class="pill" data-act="edit-iti" data-idx="${oIdx}">${icon("edit", 12)} 改</button>
+                <button type="button" class="pill ${hasMem(it) ? "gift" : ""}" data-act="open-memory" data-idx="${oIdx}">${icon(
+          "star",
+          12
+        )} ${hasMem(it) ? (it.rating ? memStars(it.rating) : "回憶") : "記低"}</button>
               </div>
+              ${
+                hasMem(it)
+                  ? `<p class="mem-snip">${it.rating ? memStars(it.rating) + " " : ""}${esc(it.memory || "已有相片")}</p>`
+                  : ""
+              }
             </div>
           </div>
         </div>`;
@@ -895,6 +1277,7 @@ HH:MM|類型|項目名稱|GoogleMap地點
       ["packing", "行李"],
       ["souvenirs", "手信"],
       ["docs", "文件"],
+      ["tickets", "票據"],
     ];
     let body = `<div class="subtabs">${subs
       .map((s) => `<button class="subtab ${sub === s[0] ? "on" : ""}" data-act="sub" data-tab="lists" data-id="${s[0]}">${s[1]}</button>`)
@@ -953,6 +1336,31 @@ HH:MM|類型|項目名稱|GoogleMap地點
           )
           .join("") || `<p class="help">未有手信清單</p>`}
       </div>`;
+    } else if (sub === "tickets") {
+      t.tickets = t.tickets || [];
+      body += `<div class="toolbar">
+        <button class="btn btn-soft btn-sm" data-act="add-ticket">${icon("plus", 14)} 新增票據</button>
+      </div>
+      ${
+        t.tickets
+          .map(
+            (tk) => `<div class="card card-pad" style="margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
+              <div>
+                <span class="pill">${esc(tk.kind || "其他")}</span>
+                <h4 style="margin:8px 0 4px;font-family:var(--display)">${esc(tk.title)}</h4>
+                ${tk.note ? `<p class="help">${esc(tk.note)}</p>` : ""}
+              </div>
+              <div>
+                <button type="button" class="icon-btn" data-act="edit-ticket" data-id="${tk.id}">${icon("edit", 16)}</button>
+                <button type="button" class="icon-btn danger" data-act="del-ticket" data-id="${tk.id}">${icon("trash", 16)}</button>
+              </div>
+            </div>
+            ${photoGrid(tk.photoIds, { kind: "ticket", parent: tk.id })}
+          </div>`
+          )
+          .join("") || `<div class="card empty"><p>未有票據。可影機票、酒店確認、JR Pass。</p></div>`
+      }`;
     } else {
       if (!t.docs?.length) {
         t.docs = ["護照", "簽證／入境卡", "旅遊保險", "機票／車票", "酒店確認", "信用卡／現金", "轉換插頭", "常用藥物"].map((text) => ({
@@ -978,6 +1386,68 @@ HH:MM|類型|項目名稱|GoogleMap地點
       </div>`;
     }
     return body;
+  }
+
+  function tabJournal(t) {
+    const view = state.sub.journalView || "day";
+    const top = `<div class="subtabs">
+      <button type="button" class="subtab ${view === "day" ? "on" : ""}" data-act="sub" data-tab="journalView" data-id="day">按日</button>
+      <button type="button" class="subtab ${view === "spots" ? "on" : ""}" data-act="sub" data-tab="journalView" data-id="spots">景點回憶</button>
+    </div>`;
+    if (view === "spots") {
+      const list = spotsList(t, state.spotQuery);
+      const remembered = (t.itinerary || []).filter(hasMem).length;
+      return `${top}
+        ${searchField("spot-q", "搵已有評論嘅景點…", state.spotQuery)}
+        <p class="help">${remembered} 個景點已有評論</p>
+        <div id="spot-results" class="mem-list">
+          ${list.map(({ it, idx }) => spotCard(t, it, idx)).join("") || spotsEmpty(state.spotQuery)}
+        </div>`;
+    }
+    const days = tripDays(t);
+    const st = tripStatus(t);
+    const today = st === "now" ? currentDayIndex(t) : st === "upcoming" ? 1 : days;
+    const day = Number(state.sub.journalDay) || today;
+    state.sub.journalDay = String(day);
+    const j = journalOf(t, day, false) || { text: "", rating: 0, photoIds: [], day: String(day) };
+    const date = dateOfDay(t, day);
+    const chips = Array.from({ length: days }, (_, i) => {
+      const d = i + 1;
+      const row = journalOf(t, d, false);
+      const mark = row?.rating ? "★".repeat(row.rating) : row?.text ? "·" : "";
+      return `<button type="button" class="subtab ${d === day ? "on" : ""}" data-act="journal-day" data-id="${d}">D${d}${
+        mark ? ` ${mark.slice(0, 1)}` : ""
+      }</button>`;
+    }).join("");
+    const daySpots = itemsForDay(t, day);
+    return `${top}
+      <div class="subtabs">${chips}</div>
+      <div class="card card-pad">
+        <p class="kicker" style="color:var(--muted)">第 ${day} 日 · ${niceDate(date)}（${weekday(date)}）</p>
+        <h3 style="margin:4px 0 10px;font-family:var(--display)">今日記低</h3>
+        <div class="help" style="margin-bottom:6px">體驗評分</div>
+        ${starsHtml(j.rating, `data-act="rate-journal" data-day="${day}"`)}
+        <form class="form" data-submit="save-journal" style="margin-top:14px">
+          <input type="hidden" name="day" value="${day}">
+          <div class="field"><label>寫低排隊、好食、改行程…</label>
+            <textarea name="text" placeholder="例如：泉天空之湯好正，行李櫃 $500。">${esc(j.text || "")}</textarea>
+          </div>
+          <button class="btn btn-primary">儲存呢日</button>
+        </form>
+        <div class="help" style="margin-top:16px">相片附件</div>
+        ${photoGrid(j.photoIds, { kind: "journal", parent: String(day), day: String(day) })}
+      </div>
+      ${
+        daySpots.length
+          ? `<h3 style="margin:18px 0 10px;font-size:1rem">呢日嘅景點</h3>
+        <div class="mem-list">${daySpots
+          .map((it) => {
+            const idx = t.itinerary.indexOf(it);
+            return spotCard(t, it, idx);
+          })
+          .join("")}</div>`
+          : ""
+      }`;
   }
 
   function tabMoney(t) {
@@ -1219,6 +1689,7 @@ HH:MM|類型|項目名稱|GoogleMap地點
       state.view = "home";
       root.innerHTML = viewHome();
     }
+    hydratePhotos();
   }
 
   function calcFx() {
@@ -1297,6 +1768,14 @@ HH:MM|類型|項目名稱|GoogleMap地點
     "delete-trip": async (ds) => {
       const ok = await confirmModal("刪除旅程", "刪除後無法還原（除非你有匯出備份）。", "刪除");
       if (!ok) return;
+      const gone = state.trips.find((t) => t.id === ds.id);
+      if (gone) {
+        for (const id of tripPhotoIds(gone)) {
+          try {
+            await removePhoto(id);
+          } catch {}
+        }
+      }
       state.trips = state.trips.filter((t) => t.id !== ds.id);
       if (state.tripId === ds.id) {
         state.tripId = null;
@@ -1344,8 +1823,15 @@ HH:MM|類型|項目名稱|GoogleMap地點
       input.click();
     },
     wipe: async () => {
-      const ok = await confirmModal("清除資料", "會刪除所有本機旅程。", "清除");
+      const ok = await confirmModal("清除資料", "會刪除所有本機旅程同相片。", "清除");
       if (!ok) return;
+      for (const t of state.trips) {
+        for (const id of tripPhotoIds(t)) {
+          try {
+            await removePhoto(id);
+          } catch {}
+        }
+      }
       state.trips = [];
       persist();
       state.view = "home";
@@ -1407,14 +1893,29 @@ HH:MM|類型|項目名稱|GoogleMap地點
         ],
       });
     },
-    "del-iti": (ds) => {
+    "del-iti": async (ds) => {
       const t = trip();
+      const it = t.itinerary[Number(ds.idx)];
+      if (it) {
+        for (const id of it.photoIds || []) {
+          try {
+            await removePhoto(id);
+          } catch {}
+        }
+      }
       t.itinerary.splice(Number(ds.idx), 1);
       saveTrip(t);
     },
     "clear-iti": async () => {
       if (!(await confirmModal("清空行程", "確定清空所有行程項目？"))) return;
       const t = trip();
+      for (const it of t.itinerary || []) {
+        for (const id of it.photoIds || []) {
+          try {
+            await removePhoto(id);
+          } catch {}
+        }
+      }
       t.itinerary = [];
       saveTrip(t);
     },
@@ -1592,11 +2093,165 @@ HH:MM|類型|項目名稱|GoogleMap地點
       calcFx();
     },
     print: () => window.print(),
+    "share-today": async () => {
+      const t = trip();
+      if (!t) return;
+      closeModal();
+      const text = todayShareText(t);
+      if (navigator.share) {
+        try {
+          await navigator.share({ title: `${t.destination} 今日行程`, text });
+          return;
+        } catch (err) {
+          if (err && err.name === "AbortError") return;
+        }
+      }
+      try {
+        await navigator.clipboard.writeText(text);
+        toast("已複製今日行程，可貼到 WhatsApp");
+      } catch {
+        toast("無法分享，請改用匯出");
+      }
+    },
+    "share-qr": () => {
+      const t = trip();
+      if (!t) return;
+      const text = todayShareText(t).slice(0, 1200);
+      const src = `https://api.qrserver.com/v1/create-qr-code/?size=280x280&ecc=M&data=${encodeURIComponent(text)}`;
+      openModal(`
+        <h3>今日行程 QR</h3>
+        <p class="help">畀同行用相機掃，會見到今日時間表同地圖連結。</p>
+        <img src="${src}" alt="QR" style="width:min(280px,100%);margin:12px auto;display:block;border-radius:16px;background:#fff;padding:10px">
+        <div class="modal-actions">
+          <button type="button" class="btn btn-soft" data-act="share-today">${icon("share", 14)} 分享文字</button>
+          <button type="button" class="btn btn-primary" data-act="close-modal">關閉</button>
+        </div>`);
+    },
+    "journal-day": (ds) => {
+      state.sub.journalDay = ds.id;
+      render();
+    },
+    "open-memory": (ds) => {
+      if (ds.trip && ds.trip !== state.tripId) {
+        state.tripId = ds.trip;
+        state.view = "trip";
+        state.tab = "journal";
+        state.sub.journalView = "spots";
+        render();
+      }
+      openMemory(Number(ds.idx));
+    },
+    "del-memory": async (ds) => {
+      if (ds.trip) state.tripId = ds.trip;
+      const t = trip();
+      const it = t?.itinerary?.[Number(ds.idx)];
+      if (!it || !hasMem(it)) return;
+      if (!(await confirmModal("刪除評論", "確定刪除呢個景點嘅評分、文字同相片？行程項目會留低。", "刪除"))) return;
+      await clearItemMemory(it);
+      closeModal();
+      saveTrip(t);
+      toast("已刪除評論");
+    },
+    "rate-item": (ds) => {
+      const t = trip();
+      const it = t?.itinerary?.[Number(ds.idx)];
+      if (!it) return;
+      it.rating = Number(ds.n);
+      saveTrip(t, false);
+      persist();
+      const stars = document.querySelector("#modal-root .stars");
+      if (stars) {
+        stars.querySelectorAll("button").forEach((b) => {
+          b.classList.toggle("on", Number(b.dataset.n) <= it.rating);
+        });
+      }
+    },
+    "rate-journal": (ds) => {
+      const t = trip();
+      const j = journalOf(t, ds.day, true);
+      j.rating = Number(ds.n);
+      saveTrip(t);
+    },
+    "pick-photo": (ds) => {
+      photoCtx = { kind: ds.kind, parent: ds.parent, day: ds.day };
+      const input = $("#lutu-photo");
+      if (input) {
+        input.value = "";
+        input.click();
+      }
+    },
+    "view-photo": async (ds) => {
+      const src = await photoSrc(ds.id);
+      if (!src) return;
+      openModal(`<img src="${src}" alt="" style="width:100%;border-radius:16px">
+        <div class="modal-actions"><button type="button" class="btn btn-primary" data-act="close-modal">關閉</button></div>`);
+    },
+    "del-photo": async (ds) => {
+      const t = trip();
+      if (!t) return;
+      if (ds.kind === "ticket") {
+        const tk = (t.tickets || []).find((x) => x.id === ds.parent);
+        if (tk) tk.photoIds = (tk.photoIds || []).filter((id) => id !== ds.id);
+      } else if (ds.kind === "journal") {
+        const j = journalOf(t, ds.parent || ds.day, false);
+        if (j) j.photoIds = (j.photoIds || []).filter((id) => id !== ds.id);
+      } else if (ds.kind === "item") {
+        const it = (t.itinerary || []).find((x) => x.id === ds.parent);
+        if (it) it.photoIds = (it.photoIds || []).filter((id) => id !== ds.id);
+      }
+      try {
+        await removePhoto(ds.id);
+      } catch {}
+      saveTrip(t);
+      if (ds.kind === "item") {
+        const idx = (t.itinerary || []).findIndex((x) => x.id === ds.parent);
+        if (idx >= 0) openMemory(idx);
+      }
+    },
+    "add-ticket": () => {
+      pendingForm = { kind: "add-ticket" };
+      formModal({
+        title: "新增票據",
+        fields: [
+          { name: "kind", label: "類型", type: "select", options: ["機票", "酒店", "車票", "簽證", "保險", "其他"] },
+          { name: "title", label: "名稱", required: true, placeholder: "例如 QR812 電子登機證" },
+          { name: "note", label: "備註", type: "textarea", placeholder: "確認號、座位…" },
+        ],
+      });
+    },
+    "edit-ticket": (ds) => {
+      const t = trip();
+      const tk = (t.tickets || []).find((x) => x.id === ds.id);
+      if (!tk) return;
+      pendingForm = { kind: "edit-ticket", id: ds.id };
+      formModal({
+        title: "修改票據",
+        fields: [
+          { name: "kind", label: "類型", type: "select", options: ["機票", "酒店", "車票", "簽證", "保險", "其他"], value: tk.kind },
+          { name: "title", label: "名稱", required: true, value: tk.title },
+          { name: "note", label: "備註", type: "textarea", value: tk.note || "" },
+        ],
+      });
+    },
+    "del-ticket": async (ds) => {
+      const t = trip();
+      const tk = (t.tickets || []).find((x) => x.id === ds.id);
+      if (!tk) return;
+      for (const id of tk.photoIds || []) {
+        try {
+          await removePhoto(id);
+        } catch {}
+      }
+      t.tickets = t.tickets.filter((x) => x.id !== ds.id);
+      saveTrip(t);
+    },
     "trip-menu": () => {
       const t = trip();
       openModal(`
         <h3>旅程選項</h3>
         <div class="form">
+          <button class="btn btn-soft btn-block" data-act="share-today">${icon("share")} 分享今日行程</button>
+          <button class="btn btn-soft btn-block" data-act="share-qr">${icon("link")} 今日 QR</button>
           <button class="btn btn-soft btn-block" data-act="export-trip" data-id="${t.id}">${icon("down")} 匯出呢個旅程</button>
           <button class="btn btn-soft btn-block" data-act="dup-trip">${icon("copy")} 複製旅程</button>
           <button class="btn btn-soft btn-block" data-act="print">${icon("print")} 列印</button>
@@ -1653,12 +2308,38 @@ HH:MM|類型|項目名稱|GoogleMap地點
     });
   }
 
-  function download(name, text) {
+  async function download(name, text) {
+    const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+    const file = new File([blob], name, { type: "application/json" });
+    if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: name });
+        toast("已匯出");
+        return;
+      } catch (err) {
+        if (err && err.name === "AbortError") return;
+      }
+    }
+    const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+    a.href = url;
     a.download = name;
+    a.rel = "noopener";
+    a.style.display = "none";
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(a.href);
+    setTimeout(() => {
+      a.remove();
+      URL.revokeObjectURL(url);
+    }, 1500);
+    if (/iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+      try {
+        await navigator.clipboard.writeText(text);
+        toast("iPhone 已複製行程內容，可貼到備忘錄或檔案 App");
+        return;
+      } catch {}
+    }
+    toast("已匯出 " + name);
   }
 
   function handleSubmit(form) {
@@ -1670,6 +2351,29 @@ HH:MM|類型|項目名稱|GoogleMap地點
       closeModal();
       toast("已儲存 AI 端點");
       render();
+      return;
+    }
+    if (kind === "save-journal") {
+      const t = trip();
+      if (!t) return;
+      const j = journalOf(t, data.day, true);
+      j.text = data.text || "";
+      saveTrip(t);
+      toast("已記低呢日");
+      return;
+    }
+    if (kind === "save-memory") {
+      const t = trip();
+      if (!t) return;
+      const it = t.itinerary[Number(data.idx)];
+      if (it) {
+        it.memory = data.memory || "";
+        it.photoIds = it.photoIds || [];
+        it.rating = Number(it.rating) || 0;
+      }
+      closeModal();
+      saveTrip(t);
+      toast("已記低呢個景點");
       return;
     }
     if (kind === "chat") {
@@ -1699,6 +2403,8 @@ HH:MM|類型|項目名稱|GoogleMap地點
         packing: [],
         souvenirs: [],
         docs: [],
+        tickets: [],
+        journal: [],
         expenses: [],
         stays: [],
         transport: [],
@@ -1721,7 +2427,7 @@ HH:MM|類型|項目名稱|GoogleMap地點
     }
     if (!t) return;
     if (p.kind === "add-iti") {
-      t.itinerary.push({ id: uid(), ...data });
+      t.itinerary.push({ id: uid(), ...data, memory: "", rating: 0, photoIds: [] });
     } else if (p.kind === "edit-iti") {
       Object.assign(t.itinerary[p.idx], data);
     } else if (p.kind === "add-pack") {
@@ -1751,6 +2457,12 @@ HH:MM|類型|項目名稱|GoogleMap地點
       t.notes = data.notes;
     } else if (p.kind === "edit-em") {
       t.emergency = data.emergency;
+    } else if (p.kind === "add-ticket") {
+      t.tickets = t.tickets || [];
+      t.tickets.push({ id: uid(), kind: data.kind, title: data.title, note: data.note || "", photoIds: [] });
+    } else if (p.kind === "edit-ticket") {
+      const tk = (t.tickets || []).find((x) => x.id === p.id);
+      if (tk) Object.assign(tk, { kind: data.kind, title: data.title, note: data.note || "" });
     }
     pendingForm = null;
     closeModal();
@@ -1792,6 +2504,8 @@ HH:MM|類型|項目名稱|GoogleMap地點
     if (btn.tagName === "INPUT" && btn.type === "checkbox") return;
     const act = btn.dataset.act;
     if (["calc-fx", "home-cur", "ai-mode"].includes(act)) return;
+    e.preventDefault();
+    e.stopPropagation();
     on[act]?.(btn.dataset, btn, e);
   });
   document.addEventListener("change", (e) => {
@@ -1812,8 +2526,32 @@ HH:MM|類型|項目名稱|GoogleMap地點
     }
     if (act === "calc-fx") calcFx();
   });
+  document.addEventListener("keydown", (e) => {
+    if (!isSearchBox(e.target)) return;
+    if (e.isComposing || e.keyCode === 229 || e.key === "Process") {
+      e.target.dataset.composing = "1";
+      clearTimeout(searchTimer);
+    }
+  });
+  document.addEventListener("compositionstart", (e) => {
+    if (!isSearchBox(e.target)) return;
+    e.target.dataset.composing = "1";
+    clearTimeout(searchTimer);
+  });
+  document.addEventListener("compositionend", (e) => {
+    if (!isSearchBox(e.target)) return;
+    e.target.dataset.composing = "0";
+    clearTimeout(searchTimer);
+    applySearchBox(e.target);
+  });
   document.addEventListener("input", (e) => {
     if (e.target.id === "exAmt") calcFx();
+    if (!isSearchBox(e.target)) return;
+    if (e.isComposing || e.target.dataset.composing === "1") return;
+    if (e.inputType === "insertCompositionText" || e.inputType === "deleteCompositionText") return;
+    const el = e.target;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => applySearchBox(el), 280);
   });
   document.addEventListener("submit", (e) => {
     const form = e.target.closest("[data-submit]");
@@ -1821,6 +2559,54 @@ HH:MM|類型|項目名稱|GoogleMap地點
     e.preventDefault();
     handleSubmit(form);
   });
+
+  const photoInput = $("#lutu-photo");
+  if (photoInput) {
+    photoInput.addEventListener("change", async () => {
+      const file = photoInput.files && photoInput.files[0];
+      photoInput.value = "";
+      if (!file || !photoCtx) return;
+      const t = trip();
+      if (!t) return;
+      try {
+        setBusy("儲存相片", "壓縮緊…");
+        const blob = await compressImage(file);
+        const id = uid();
+        await putPhoto(id, blob);
+        if (photoCtx.kind === "ticket") {
+          t.tickets = t.tickets || [];
+          const tk = t.tickets.find((x) => x.id === photoCtx.parent);
+          if (!tk) throw new Error("搵唔到呢張票據");
+          tk.photoIds = tk.photoIds || [];
+          if (tk.photoIds.length >= 8) throw new Error("每張票據最多 8 張相");
+          tk.photoIds.push(id);
+        } else if (photoCtx.kind === "journal") {
+          const j = journalOf(t, photoCtx.parent || photoCtx.day, true);
+          j.photoIds = j.photoIds || [];
+          if (j.photoIds.length >= 8) throw new Error("每日最多 8 張相");
+          j.photoIds.push(id);
+        } else if (photoCtx.kind === "item") {
+          const it = (t.itinerary || []).find((x) => x.id === photoCtx.parent);
+          if (!it) throw new Error("搵唔到呢個行程");
+          it.photoIds = it.photoIds || [];
+          if (it.photoIds.length >= 8) throw new Error("每個景點最多 8 張相");
+          it.photoIds.push(id);
+        }
+        const reopenItem = photoCtx.kind === "item" ? photoCtx.parent : null;
+        photoCtx = null;
+        clearBusy();
+        saveTrip(t);
+        toast("已加入相片");
+        if (reopenItem) {
+          const idx = (t.itinerary || []).findIndex((x) => x.id === reopenItem);
+          if (idx >= 0) openMemory(idx);
+        }
+      } catch (err) {
+        clearBusy();
+        toast(err.message || "儲存相片失敗");
+      }
+    });
+  }
 
   load();
   render();

@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Lutu 旅途 — 智能旅遊小助手</title>
   <meta name="description" content="規劃行程、行李、手信、花費與匯率。本機儲存，可離線使用。" />
-  <meta name="theme-color" content="#1f6b63" />
+  <meta name="theme-color" content="#efe6d9" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Lutu 旅途" />
@@ -16,14 +17,15 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="css/app.css" />
+  <link rel="stylesheet" href="css/app.css?v=7" />
 </head>
 <body>
   <div class="grain" aria-hidden="true"></div>
   <div id="app"></div>
   <div id="modal-root"></div>
   <div id="toast-root"></div>
-  <script src="js/app.js"></script>
+  <input id="lutu-photo" class="sr-file" type="file" accept="image/*" />
+  <script src="js/app.js?v=7"></script>
   <script>
     if ("serviceWorker" in navigator) {
       window.addEventListener("load", () => navigator.serviceWorker.register("./sw.js"));
